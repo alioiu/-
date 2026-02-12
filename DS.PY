@@ -156,23 +156,26 @@ def admin_reply_kb():
     )
 
 
-def ensure_user(uid: int, ref: int | None = None) -> None:
+def ensure_user(uid: int, ref: int | None = None) -> tuple[bool, bool]:
     cur.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
     exists = cur.fetchone()
     if exists:
-        return
+        return False, False
 
     cur.execute(
         "INSERT INTO users (user_id, minutes, invited_by) VALUES (?, ?, ?)",
         (uid, 1 if ref else 0, ref if ref != uid else None),
     )
 
+    rewarded_ref = False
     if ref and ref != uid:
         cur.execute(
             "UPDATE users SET minutes = minutes + 1, referrals = referrals + 1 WHERE user_id=?",
             (ref,),
         )
+        rewarded_ref = cur.rowcount > 0
     db.commit()
+    return True, rewarded_ref
 
 
 def is_admin(uid: int) -> bool:
@@ -224,7 +227,19 @@ def get_next_link(uid: int):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ref = int(context.args[0]) if context.args and context.args[0].isdigit() else None
-    ensure_user(uid, ref)
+    created, rewarded_ref = ensure_user(uid, ref)
+
+    if created and ref and rewarded_ref:
+        try:
+            await context.bot.send_message(
+                chat_id=ref,
+                text=(
+                    "🎉 شخص جديد دخل برابط الإحالة الخاص بك.\n"
+                    "✅ تم احتساب 1 دقيقة لك."
+                ),
+            )
+        except Exception:
+            pass
 
     await update.message.reply_text(
         "🤖 مرحبًا بك في بوت تبادل نقرات الروابط\n"
@@ -395,6 +410,16 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (owner_id,),
     )
     db.commit()
+    try:
+        await context.bot.send_message(
+            chat_id=owner_id,
+            text=(
+                "🔔 قام أحد المستخدمين بالنقر/التخطي لرابطك.\n"
+                "✅ تمت إضافة 1 دقيقة لك."
+            ),
+        )
+    except Exception:
+        pass
     context.user_data["last_confirm_at"] = now
     context.user_data.pop("pending", None)
     await q.edit_message_text("✅ تم احتساب دقيقة لك!", reply_markup=main_kb())
