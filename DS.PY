@@ -22,6 +22,8 @@ ADMIN_ID = 6637599913
 
 URL_PATTERN = re.compile(r"^(https?://)\S+$", re.IGNORECASE)
 DAILY_COOLDOWN_SECONDS = 60 * 60 * 24
+MIN_VISIT_SECONDS = 8
+CONFIRM_COOLDOWN_SECONDS = 3
 
 # ================= DATABASE =================
 db = sqlite3.connect("bot.db", check_same_thread=False)
@@ -279,11 +281,11 @@ async def skip_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if link[0] == "admin":
         _, link_id, url = link
-        context.user_data["pending"] = ("admin", link_id)
+        context.user_data["pending"] = {"type": "admin", "link_id": link_id, "shown_at": now_ts()}
         confirm_data = f"confirm_admin_{link_id}"
     else:
         _, link_id, url, owner = link
-        context.user_data["pending"] = ("user", link_id)
+        context.user_data["pending"] = {"type": "user", "link_id": link_id, "shown_at": now_ts()}
         confirm_data = f"confirm_{link_id}"
     buttons = InlineKeyboardMarkup(
         [
@@ -306,12 +308,35 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
+    now = now_ts()
+
+    last_confirm = context.user_data.get("last_confirm_at", 0)
+    if now - last_confirm < CONFIRM_COOLDOWN_SECONDS:
+        await q.answer("⏳ لا تضغط بسرعة، حاول بعد ثوانٍ قليلة.", show_alert=True)
+        return
+
+    pending = context.user_data.get("pending")
+    if not isinstance(pending, dict) or "type" not in pending or "link_id" not in pending:
+        await q.edit_message_text("❌ لا يوجد رابط نشط للتأكيد حاليًا.", reply_markup=main_kb())
+        return
+
+    shown_at = pending.get("shown_at", now)
+    if now - shown_at < MIN_VISIT_SECONDS:
+        await q.answer(
+            f"⚠️ تأكيد مبكر جدًا. انتظر {MIN_VISIT_SECONDS} ثوانٍ على الأقل داخل الرابط.",
+            show_alert=True,
+        )
+        return
+
     if q.data.startswith("confirm_admin_"):
         link_id = q.data.replace("confirm_admin_", "")
         if not link_id.isdigit():
             await q.edit_message_text("خطأ في الطلب.", reply_markup=main_kb())
             return
         link_id = int(link_id)
+        if pending.get("type") != "admin" or pending.get("link_id") != link_id:
+            await q.edit_message_text("❌ رابط التأكيد غير مطابق للرابط الحالي.", reply_markup=main_kb())
+            return
         cur.execute("SELECT url FROM admin_links WHERE id=?", (link_id,))
         row = cur.fetchone()
         if not row:
@@ -319,7 +344,7 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cur.execute(
             "INSERT OR IGNORE INTO admin_click_history (user_id, link_id, clicked_at) VALUES (?, ?, ?)",
-            (uid, link_id, now_ts()),
+            (uid, link_id, now),
         )
         if cur.rowcount == 0:
             await q.edit_message_text("تم احتساب هذا الرابط سابقًا.", reply_markup=main_kb())
@@ -329,6 +354,7 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (uid,),
         )
         db.commit()
+        context.user_data["last_confirm_at"] = now
         context.user_data.pop("pending", None)
         await q.edit_message_text("✅ تم احتساب دقيقة لك!", reply_markup=main_kb())
         return
@@ -339,9 +365,12 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     link_id = int(payload[1])
+    if pending.get("type") != "user" or pending.get("link_id") != link_id:
+        await q.edit_message_text("❌ رابط التأكيد غير مطابق للرابط الحالي.", reply_markup=main_kb())
+        return
     cur.execute(
         "SELECT owner FROM links WHERE id=? AND expires > ?",
-        (link_id, now_ts()),
+        (link_id, now),
     )
     row = cur.fetchone()
     if not row:
@@ -351,7 +380,7 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cur.execute(
         "INSERT OR IGNORE INTO click_history (user_id, link_id, clicked_at) VALUES (?, ?, ?)",
-        (uid, link_id, now_ts()),
+        (uid, link_id, now),
     )
     if cur.rowcount == 0:
         await q.edit_message_text("تم احتساب هذا الرابط سابقًا.", reply_markup=main_kb())
@@ -366,6 +395,7 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (owner_id,),
     )
     db.commit()
+    context.user_data["last_confirm_at"] = now
     context.user_data.pop("pending", None)
     await q.edit_message_text("✅ تم احتساب دقيقة لك!", reply_markup=main_kb())
 
