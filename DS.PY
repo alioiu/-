@@ -1,6 +1,9 @@
 import sqlite3
 import time
 import re
+import os
+import asyncio
+import logging
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -17,7 +20,7 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = "7910621452:AAHnrtKDSkkXFsWwVzQEf4509_fK_j5_Jjc"
+TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 6637599913
 
 URL_PATTERN = re.compile(r"^(https?://)\S+$", re.IGNORECASE)
@@ -25,9 +28,21 @@ DAILY_COOLDOWN_SECONDS = 60 * 60 * 24
 MIN_VISIT_SECONDS = 8
 CONFIRM_COOLDOWN_SECONDS = 3
 
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[logging.FileHandler("logs.txt", encoding="utf-8"), logging.StreamHandler()],
+)
+logger = logging.getLogger("click-bot")
 # ================= DATABASE =================
 db = sqlite3.connect("bot.db", check_same_thread=False)
 cur = db.cursor()
+cur.execute("PRAGMA journal_mode=WAL")
+cur.execute("PRAGMA synchronous=NORMAL")
+cur.execute("PRAGMA temp_store=MEMORY")
+cur.execute("PRAGMA cache_size=-20000")
 
 cur.execute(
     """
@@ -196,12 +211,37 @@ CREATE TABLE IF NOT EXISTS point_shop (
 
 cur.execute("INSERT OR IGNORE INTO point_shop (id, title, points_cost, minutes_reward, active) VALUES (1, '10 نقاط = 1 دقيقة', 10, 1, 1)")
 cur.execute("INSERT OR IGNORE INTO point_shop (id, title, points_cost, minutes_reward, active) VALUES (2, '50 نقاط = 6 دقائق', 50, 6, 1)")
+
+cur.executescript("""
+CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active);
+CREATE INDEX IF NOT EXISTS idx_links_expires_owner ON links(expires, owner);
+CREATE INDEX IF NOT EXISTS idx_paid_ads_expires_priority ON paid_ads(expires, priority);
+CREATE INDEX IF NOT EXISTS idx_click_history_user_link ON click_history(user_id, link_id);
+CREATE INDEX IF NOT EXISTS idx_admin_click_history_user_link ON admin_click_history(user_id, link_id);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status, requested_at);
+CREATE INDEX IF NOT EXISTS idx_spam_log_user ON spam_log(user_id, created_at);
+""")
+db.commit()
+
 db.commit()
 
 
 # ================= HELPERS =================
 def now_ts() -> int:
     return int(time.time())
+
+
+RATE_LIMIT_WINDOW = 10
+RATE_LIMIT_MAX = 8
+_request_log = {}
+
+def is_rate_limited(uid: int) -> bool:
+    now = time.time()
+    bucket = _request_log.get(uid, [])
+    bucket = [t for t in bucket if now - t <= RATE_LIMIT_WINDOW]
+    bucket.append(now)
+    _request_log[uid] = bucket
+    return len(bucket) > RATE_LIMIT_MAX
 
 
 def get_setting(key: str, default: str) -> str:
@@ -235,6 +275,7 @@ def log_spam(uid: int, reason: str) -> None:
         (uid, reason, now_ts()),
     )
     db.commit()
+    logger.warning("spam uid=%s reason=%s", uid, reason)
 
 
 def reset_daily_counters_if_needed(uid: int) -> None:
@@ -505,6 +546,13 @@ async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def skip_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = update.effective_user.id
+    if is_rate_limited(uid):
+        log_spam(uid, "rapid_requests")
+        if q:
+            await q.answer("طلبات كثيرة جدًا", show_alert=True)
+        else:
+            await update.message.reply_text("⛔ طلبات كثيرة جدًا، حاول لاحقًا")
+        return
     if "pending" in context.user_data:
         if q:
             await q.answer("⏳ أكمل التخطي الحالي أولًا", show_alert=True)
@@ -1383,7 +1431,9 @@ async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await context.bot.send_message(chat_id=user_id, text=update.message.text or "")
             sent += 1
-        except Exception:
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.exception("broadcast_error user_id=%s err=%s", user_id, e)
             continue
 
     context.user_data["broadcast"] = False
@@ -1568,6 +1618,10 @@ async def handle_text_shortcuts(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if is_rate_limited(uid):
+        log_spam(uid, "flood")
+        await update.message.reply_text("⛔ تم اكتشاف Flood/Spam. حاول بعد قليل.")
+        return
     if is_banned(uid):
         await update.message.reply_text("🚫 أنت محظور من استخدام البوت.")
         return
@@ -1684,12 +1738,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_text_shortcuts(update, context)
 
 
+
+
+async def backup_db_job(context: ContextTypes.DEFAULT_TYPE):
+    ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    target = f"backup_{ts}.db"
+    try:
+        bck = sqlite3.connect(target)
+        db.backup(bck)
+        bck.close()
+        logger.info("db_backup_created file=%s", target)
+    except Exception as e:
+        logger.exception("db_backup_failed err=%s", e)
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("unhandled_error: %s", context.error)
     try:
         if hasattr(update, "effective_message") and update.effective_message:
             await update.effective_message.reply_text("⚠️ حدث خطأ غير متوقع، حاول مرة أخرى.")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.exception("error_handler_reply_failed: %s", e)
 
 
 # ================= RUN =================
@@ -1734,5 +1802,9 @@ app.add_handler(CallbackQueryHandler(admin_back, "^back$"))
 
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_error_handler(on_error)
+app.job_queue.run_repeating(backup_db_job, interval=21600, first=300)
 
-app.run_polling()
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set. Please set BOT_TOKEN environment variable.")
+
+app.run_polling(drop_pending_updates=True)
