@@ -91,12 +91,99 @@ CREATE TABLE IF NOT EXISTS admin_click_history (
 )
 """
 )
+
+
+cur.execute("PRAGMA table_info(users)")
+user_columns = {row[1] for row in cur.fetchall()}
+if "vip" not in user_columns:
+    cur.execute("ALTER TABLE users ADD COLUMN vip INTEGER DEFAULT 0")
+if "banned" not in user_columns:
+    cur.execute("ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0")
+if "level" not in user_columns:
+    cur.execute("ALTER TABLE users ADD COLUMN level INTEGER DEFAULT 1")
+if "last_active" not in user_columns:
+    cur.execute("ALTER TABLE users ADD COLUMN last_active INTEGER DEFAULT 0")
+
+cur.execute(
+    """
+CREATE TABLE IF NOT EXISTS withdrawals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    amount INTEGER,
+    status TEXT DEFAULT 'pending',
+    note TEXT,
+    requested_at INTEGER
+)
+"""
+)
+
+cur.execute(
+    """
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+"""
+)
+
+for k, v in {
+    "referral_reward": "1",
+    "view_reward": "1",
+    "wait_seconds": str(MIN_VISIT_SECONDS),
+    "registration_enabled": "1",
+    "protection_level": "2",
+}.items():
+    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+
+cur.execute(
+    """
+CREATE TABLE IF NOT EXISTS spam_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    reason TEXT,
+    created_at INTEGER
+)
+"""
+)
 db.commit()
 
 
 # ================= HELPERS =================
 def now_ts() -> int:
     return int(time.time())
+
+
+def get_setting(key: str, default: str) -> str:
+    cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = cur.fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    cur.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+    db.commit()
+
+
+def touch_user(uid: int) -> None:
+    cur.execute("UPDATE users SET last_active=? WHERE user_id=?", (now_ts(), uid))
+    db.commit()
+
+
+def is_banned(uid: int) -> bool:
+    cur.execute("SELECT banned FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    return bool(row and row[0])
+
+
+def log_spam(uid: int, reason: str) -> None:
+    cur.execute(
+        "INSERT INTO spam_log (user_id, reason, created_at) VALUES (?, ?, ?)",
+        (uid, reason, now_ts()),
+    )
+    db.commit()
 
 
 def main_kb():
@@ -131,8 +218,12 @@ def admin_kb():
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📊 إحصائيات البوت", callback_data="a_stats")],
-            [InlineKeyboardButton("📢 رسالة جماعية", callback_data="a_bc")],
-            [InlineKeyboardButton("🏆 ترتيب الأعضاء", callback_data="a_top")],
+            [InlineKeyboardButton("📢 نظام البث", callback_data="a_bc")],
+            [InlineKeyboardButton("📈 نظام الترتيب", callback_data="a_top")],
+            [InlineKeyboardButton("👤 إدارة مستخدم", callback_data="a_user_manage")],
+            [InlineKeyboardButton("💰 إدارة السحب", callback_data="a_withdrawals")],
+            [InlineKeyboardButton("🛠️ إعدادات عامة", callback_data="a_settings")],
+            [InlineKeyboardButton("🚨 الحماية", callback_data="a_protection")],
             [InlineKeyboardButton("➕ إضافة رابط ثابت", callback_data="a_add_link")],
             [InlineKeyboardButton("🗑 حذف رابط ثابت", callback_data="a_del_link")],
             [InlineKeyboardButton("📄 قائمة الروابط", callback_data="a_list_links")],
@@ -145,8 +236,12 @@ def admin_reply_kb():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("📊 إحصائيات البوت")],
-            [KeyboardButton("📢 رسالة جماعية")],
-            [KeyboardButton("🏆 ترتيب الأعضاء")],
+            [KeyboardButton("📢 نظام البث")],
+            [KeyboardButton("📈 نظام الترتيب")],
+            [KeyboardButton("👤 إدارة مستخدم")],
+            [KeyboardButton("💰 إدارة السحب")],
+            [KeyboardButton("🛠️ إعدادات عامة")],
+            [KeyboardButton("🚨 الحماية")],
             [KeyboardButton("➕ إضافة رابط ثابت")],
             [KeyboardButton("🗑 حذف رابط ثابت")],
             [KeyboardButton("📄 قائمة الروابط")],
@@ -167,11 +262,12 @@ def ensure_user(uid: int, ref: int | None = None) -> tuple[bool, bool]:
         (uid, 1 if ref else 0, ref if ref != uid else None),
     )
 
+    referral_reward = int(get_setting("referral_reward", "1"))
     rewarded_ref = False
     if ref and ref != uid:
         cur.execute(
-            "UPDATE users SET minutes = minutes + 1, referrals = referrals + 1 WHERE user_id=?",
-            (ref,),
+            "UPDATE users SET minutes = minutes + ?, referrals = referrals + 1 WHERE user_id=?",
+            (referral_reward, ref),
         )
         rewarded_ref = cur.rowcount > 0
     db.commit()
@@ -185,7 +281,7 @@ def is_admin(uid: int) -> bool:
 def get_user(uid: int):
     cur.execute(
         "SELECT minutes, total_clicks, referrals, last_daily FROM users WHERE user_id=?",
-        (uid,),
+        (view_reward, uid),
     )
     return cur.fetchone()
 
@@ -199,7 +295,7 @@ def get_next_link(uid: int):
         ORDER BY id ASC
         LIMIT 1
         """,
-        (uid,),
+        (view_reward, uid),
     )
     admin_link = cur.fetchone()
     if admin_link:
@@ -226,8 +322,19 @@ def get_next_link(uid: int):
 # ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if is_banned(uid):
+        await update.message.reply_text("🚫 أنت محظور من استخدام البوت.")
+        return
+
     ref = int(context.args[0]) if context.args and context.args[0].isdigit() else None
+    if get_setting("registration_enabled", "1") == "0":
+        cur.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
+        if not cur.fetchone():
+            await update.message.reply_text("⛔ التسجيل متوقف حاليًا من الإدارة.")
+            return
+
     created, rewarded_ref = ensure_user(uid, ref)
+    touch_user(uid)
 
     if created and ref and rewarded_ref:
         try:
@@ -325,8 +432,12 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     now = now_ts()
 
+    wait_seconds = int(get_setting("wait_seconds", str(MIN_VISIT_SECONDS)))
+    view_reward = int(get_setting("view_reward", "1"))
+
     last_confirm = context.user_data.get("last_confirm_at", 0)
     if now - last_confirm < CONFIRM_COOLDOWN_SECONDS:
+        log_spam(uid, "rapid_confirm")
         await q.answer("⏳ لا تضغط بسرعة، حاول بعد ثوانٍ قليلة.", show_alert=True)
         return
 
@@ -336,9 +447,10 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     shown_at = pending.get("shown_at", now)
-    if now - shown_at < MIN_VISIT_SECONDS:
+    if now - shown_at < wait_seconds:
+        log_spam(uid, "early_confirm")
         await q.answer(
-            f"⚠️ تأكيد مبكر جدًا. انتظر {MIN_VISIT_SECONDS} ثوانٍ على الأقل داخل الرابط.",
+            f"⚠️ تأكيد مبكر جدًا. انتظر {wait_seconds} ثوانٍ على الأقل داخل الرابط.",
             show_alert=True,
         )
         return
@@ -350,6 +462,7 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         link_id = int(link_id)
         if pending.get("type") != "admin" or pending.get("link_id") != link_id:
+            log_spam(uid, "callback_mismatch_admin")
             await q.edit_message_text("❌ رابط التأكيد غير مطابق للرابط الحالي.", reply_markup=main_kb())
             return
         cur.execute("SELECT url FROM admin_links WHERE id=?", (link_id,))
@@ -365,8 +478,8 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("تم احتساب هذا الرابط سابقًا.", reply_markup=main_kb())
             return
         cur.execute(
-            "UPDATE users SET minutes = minutes + 1, total_clicks = total_clicks + 1 WHERE user_id=?",
-            (uid,),
+            "UPDATE users SET minutes = minutes + ?, total_clicks = total_clicks + 1 WHERE user_id=?",
+            (view_reward, uid),
         )
         db.commit()
         context.user_data["last_confirm_at"] = now
@@ -381,6 +494,7 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     link_id = int(payload[1])
     if pending.get("type") != "user" or pending.get("link_id") != link_id:
+        log_spam(uid, "callback_mismatch_user")
         await q.edit_message_text("❌ رابط التأكيد غير مطابق للرابط الحالي.", reply_markup=main_kb())
         return
     cur.execute(
@@ -402,12 +516,12 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cur.execute(
-        "UPDATE users SET minutes = minutes + 1, total_clicks = total_clicks + 1 WHERE user_id=?",
-        (uid,),
+        "UPDATE users SET minutes = minutes + ?, total_clicks = total_clicks + 1 WHERE user_id=?",
+        (view_reward, uid),
     )
     cur.execute(
-        "UPDATE users SET minutes = minutes + 1 WHERE user_id=?",
-        (owner_id,),
+        "UPDATE users SET minutes = minutes + ? WHERE user_id=?",
+        (view_reward, owner_id),
     )
     db.commit()
     try:
@@ -622,14 +736,30 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ هذا الأمر مخصص للإدارة فقط.")
         return
+
+    now = now_ts()
+    day_ago = now - 86400
     cur.execute("SELECT COUNT(*) FROM users")
     users_count = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM links WHERE expires > ?", (now_ts(),))
-    active_links = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", (day_ago,))
+    active_today = cur.fetchone()[0]
+    cur.execute("SELECT COALESCE(SUM(referrals), 0) FROM users")
+    total_referrals = cur.fetchone()[0]
+    cur.execute("SELECT COALESCE(SUM(minutes), 0) FROM users")
+    total_minutes = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users WHERE vip=1")
+    vip_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users WHERE banned=1")
+    banned_count = cur.fetchone()[0]
+
     text = (
-        f"📊 إحصائيات البوت:\n"
-        f"👥 المستخدمون: {users_count}\n"
-        f"🔗 الروابط الفعالة: {active_links}"
+        "📊 إحصائيات شاملة\n"
+        f"👥 إجمالي المستخدمين: {users_count}\n"
+        f"🟢 النشطون اليوم: {active_today}\n"
+        f"🤝 إجمالي الإحالات: {total_referrals}\n"
+        f"⏱ إجمالي الدقائق: {total_minutes}\n"
+        f"💎 عدد VIP: {vip_count}\n"
+        f"🚫 عدد المحظورين: {banned_count}"
     )
     if q:
         await q.answer()
@@ -647,24 +777,16 @@ async def admin_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ هذا الأمر مخصص للإدارة فقط.")
         return
-    cur.execute(
-        "SELECT user_id, minutes FROM users ORDER BY minutes DESC LIMIT 10"
-    )
-    rows = cur.fetchall()
-    if not rows:
-        if q:
-            await q.answer()
-            await q.edit_message_text("لا يوجد ترتيب بعد.", reply_markup=admin_kb())
-        else:
-            await update.message.reply_text(
-                "لا يوجد ترتيب بعد.", reply_markup=admin_reply_kb()
-            )
-        return
 
-    lines = []
-    for idx, (user_id, minutes) in enumerate(rows, start=1):
-        lines.append(f"{idx}. {user_id} — {minutes} دقيقة")
-    text = "🏆 أفضل 10:\n" + "\n".join(lines)
+    cur.execute("SELECT user_id, referrals FROM users ORDER BY referrals DESC LIMIT 10")
+    refs = cur.fetchall()
+    cur.execute("SELECT user_id, total_clicks FROM users ORDER BY total_clicks DESC LIMIT 10")
+    active = cur.fetchall()
+    ref_lines = [f"{i}. {u} — {r}" for i, (u, r) in enumerate(refs, 1)] or ["لا يوجد"]
+    act_lines = [f"{i}. {u} — {c}" for i, (u, c) in enumerate(active, 1)] or ["لا يوجد"]
+    text = "📈 نظام الترتيب:\n\n🏅 أفضل 10 إحالات:\n" + "\n".join(ref_lines) + "\n\n🔥 أفضل 10 نشاط:\n" + "\n".join(act_lines)
+
+
     if q:
         await q.answer()
         await q.edit_message_text(text, reply_markup=admin_kb())
@@ -677,19 +799,14 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
         if q:
-            await q.answer()
-            await q.edit_message_text("غير مصرح.", reply_markup=main_kb())
+            await q.answer("غير مصرح.", show_alert=True)
         else:
-            await update.message.reply_text("غير مصرح.", reply_markup=main_reply_kb())
+            await update.message.reply_text("❌ هذا الأمر مخصص للإدارة فقط.")
         return
-    context.user_data["broadcast"] = True
     if q:
-        await q.answer()
-        await q.edit_message_text("أرسل الرسالة ليتم إرسالها للجميع.")
+        await admin_broadcast_menu(update, context)
     else:
-        await update.message.reply_text(
-            "أرسل الرسالة ليتم إرسالها للجميع.", reply_markup=admin_reply_kb()
-        )
+        await update.message.reply_text("استخدم لوحة الأدمن لاختيار نوع البث.", reply_markup=admin_reply_kb())
 
 
 async def admin_add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -706,9 +823,7 @@ async def admin_add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         await q.edit_message_text("أرسل الرابط المختصر لإضافته بشكل دائم.")
     else:
-        await update.message.reply_text(
-            "أرسل الرابط المختصر لإضافته بشكل دائم.", reply_markup=admin_reply_kb()
-        )
+        await update.message.reply_text("أرسل الرابط المختصر لإضافته بشكل دائم.", reply_markup=admin_reply_kb())
 
 
 async def admin_delete_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -730,17 +845,12 @@ async def admin_delete_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(message, reply_markup=admin_reply_kb())
         return
-    buttons = [
-        [InlineKeyboardButton(f"حذف {row[0]}", callback_data=f"admin_del_{row[0]}")]
-        for row in rows
-    ]
+    buttons = [[InlineKeyboardButton(f"حذف {row[0]}", callback_data=f"admin_del_{row[0]}")] for row in rows]
     if q:
         await q.answer()
         await q.edit_message_text("اختر رابطًا للحذف:", reply_markup=InlineKeyboardMarkup(buttons))
     else:
-        await update.message.reply_text(
-            "اختر رابطًا للحذف:", reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        await update.message.reply_text("اختر رابطًا للحذف:", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_list_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -754,12 +864,7 @@ async def admin_list_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     cur.execute("SELECT id, url FROM admin_links ORDER BY id ASC LIMIT 50")
     rows = cur.fetchall()
-    if not rows:
-        message = "لا توجد روابط ثابتة."
-    else:
-        message = "📄 الروابط الثابتة:\n" + "\n".join(
-            [f"{row[0]}. {row[1]}" for row in rows]
-        )
+    message = "لا توجد روابط ثابتة." if not rows else "📄 الروابط الثابتة:\n" + "\n".join([f"{row[0]}. {row[1]}" for row in rows])
     if q:
         await q.answer()
         await q.edit_message_text(message, reply_markup=admin_kb())
@@ -800,13 +905,284 @@ async def handle_admin_link_message(update: Update, context: ContextTypes.DEFAUL
     if not URL_PATTERN.match(url):
         await update.message.reply_text("الرجاء إرسال رابط صحيح.")
         return
-    cur.execute(
-        "INSERT INTO admin_links (url, added_at) VALUES (?, ?)",
-        (url, now_ts()),
-    )
+    cur.execute("INSERT INTO admin_links (url, added_at) VALUES (?, ?)", (url, now_ts()))
     db.commit()
     context.user_data["awaiting_admin_link"] = False
     await update.message.reply_text("✅ تم إضافة الرابط الثابت.", reply_markup=admin_reply_kb())
+
+
+async def admin_user_manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        if q:
+            await q.answer("غير مصرح.", show_alert=True)
+        else:
+            await update.message.reply_text("❌ هذا الأمر مخصص للإدارة فقط.")
+        return
+    context.user_data["awaiting_user_id"] = True
+    if q:
+        await q.answer()
+        await q.edit_message_text("أرسل ID المستخدم لإدارته.")
+    else:
+        await update.message.reply_text("أرسل ID المستخدم لإدارته.", reply_markup=admin_reply_kb())
+
+
+async def admin_show_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int):
+    cur.execute("SELECT minutes, referrals, total_clicks, vip, banned, level FROM users WHERE user_id=?", (target_id,))
+    row = cur.fetchone()
+    if not row:
+        await update.message.reply_text("المستخدم غير موجود.", reply_markup=admin_reply_kb())
+        return
+    minutes, refs, clicks, vip, banned, level = row
+    text = (
+        f"👤 المستخدم: {target_id}\n"
+        f"⏱ الرصيد: {minutes}\n"
+        f"🤝 إحالات: {refs}\n"
+        f"✅ نقرات: {clicks}\n"
+        f"🏷 المستوى: {level}\n"
+        f"💎 VIP: {'نعم' if vip else 'لا'}\n"
+        f"🚫 محظور: {'نعم' if banned else 'لا'}"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ تعديل الرصيد", callback_data=f"u_addm_{target_id}")],
+        [InlineKeyboardButton("🏷 تعديل المستوى", callback_data=f"u_level_{target_id}")],
+        [InlineKeyboardButton("💎 إعطاء VIP", callback_data=f"u_vip_on_{target_id}"), InlineKeyboardButton("❌ سحب VIP", callback_data=f"u_vip_off_{target_id}")],
+        [InlineKeyboardButton("🚫 حظر", callback_data=f"u_ban_{target_id}"), InlineKeyboardButton("✅ فك الحظر", callback_data=f"u_unban_{target_id}")],
+        [InlineKeyboardButton("🗑 حذف الحساب", callback_data=f"u_del_{target_id}")],
+    ])
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def admin_user_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await q.answer("غير مصرح.", show_alert=True)
+        return
+    data = q.data.split("_")
+    await q.answer()
+    if len(data) < 3:
+        await q.edit_message_text("خطأ في الطلب.", reply_markup=admin_kb())
+        return
+    action = "_".join(data[1:-1])
+    target_id = int(data[-1])
+
+    if action == "addm":
+        context.user_data["awaiting_add_minutes"] = target_id
+        await q.edit_message_text("أرسل قيمة الرصيد (يمكن بالسالب).")
+        return
+    if action == "level":
+        context.user_data["awaiting_level"] = target_id
+        await q.edit_message_text("أرسل المستوى الجديد (رقم).")
+        return
+    if action == "vip_on":
+        cur.execute("UPDATE users SET vip=1 WHERE user_id=?", (target_id,))
+    elif action == "vip_off":
+        cur.execute("UPDATE users SET vip=0 WHERE user_id=?", (target_id,))
+    elif action == "ban":
+        cur.execute("UPDATE users SET banned=1 WHERE user_id=?", (target_id,))
+    elif action == "unban":
+        cur.execute("UPDATE users SET banned=0 WHERE user_id=?", (target_id,))
+    elif action == "del":
+        cur.execute("DELETE FROM users WHERE user_id=?", (target_id,))
+        cur.execute("DELETE FROM links WHERE owner=?", (target_id,))
+        cur.execute("DELETE FROM click_history WHERE user_id=?", (target_id,))
+    db.commit()
+    await q.edit_message_text("✅ تم تنفيذ العملية.", reply_markup=admin_kb())
+
+
+async def admin_withdrawals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        if q:
+            await q.answer("غير مصرح.", show_alert=True)
+        else:
+            await update.message.reply_text("❌ هذا الأمر مخصص للإدارة فقط.")
+        return
+    cur.execute("SELECT id, user_id, amount FROM withdrawals WHERE status='pending' ORDER BY id ASC LIMIT 20")
+    rows = cur.fetchall()
+    if not rows:
+        msg = "لا توجد طلبات سحب معلقة."
+        if q:
+            await q.answer(); await q.edit_message_text(msg, reply_markup=admin_kb())
+        else:
+            await update.message.reply_text(msg, reply_markup=admin_reply_kb())
+        return
+    buttons = []
+    lines = ["💰 طلبات السحب:"]
+    for wid, user_id, amount in rows:
+        lines.append(f"#{wid} - {user_id} - {amount}")
+        buttons.append([InlineKeyboardButton(f"✅ قبول #{wid}", callback_data=f"wd_ok_{wid}"), InlineKeyboardButton(f"❌ رفض #{wid}", callback_data=f"wd_no_{wid}")])
+        buttons.append([InlineKeyboardButton(f"📝 ملاحظة #{wid}", callback_data=f"wd_note_{wid}")])
+    kb = InlineKeyboardMarkup(buttons)
+    if q:
+        await q.answer(); await q.edit_message_text("\n".join(lines), reply_markup=kb)
+    else:
+        await update.message.reply_text("\n".join(lines), reply_markup=kb)
+
+
+async def admin_withdrawal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await q.answer("غير مصرح.", show_alert=True)
+        return
+    _, action, wid = q.data.split("_")
+    wid = int(wid)
+    if action == "ok":
+        cur.execute("UPDATE withdrawals SET status='accepted' WHERE id=?", (wid,))
+    elif action == "no":
+        cur.execute("UPDATE withdrawals SET status='rejected' WHERE id=?", (wid,))
+    elif action == "note":
+        context.user_data["awaiting_withdraw_note"] = wid
+        await q.answer(); await q.edit_message_text("أرسل الملاحظة الآن.")
+        return
+    db.commit()
+    await q.answer("تم")
+    await q.edit_message_text("✅ تم تحديث طلب السحب.", reply_markup=admin_kb())
+
+
+async def admin_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        if q:
+            await q.answer("غير مصرح.", show_alert=True)
+        else:
+            await update.message.reply_text("❌ هذا الأمر مخصص للإدارة فقط.")
+        return
+    text = (
+        "🛠️ الإعدادات الحالية\n"
+        f"🎁 مكافأة الإحالة: {get_setting('referral_reward', '1')}\n"
+        f"👀 مكافأة المشاهدة: {get_setting('view_reward', '1')}\n"
+        f"⏳ وقت الانتظار: {get_setting('wait_seconds', str(MIN_VISIT_SECONDS))}\n"
+        f"📝 التسجيل: {'مفعل' if get_setting('registration_enabled', '1') == '1' else 'معطل'}\n"
+        f"🛡 مستوى الحماية: {get_setting('protection_level', '2')}"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("تغيير مكافأة الإحالة", callback_data="set_ref")],
+        [InlineKeyboardButton("تغيير مكافأة المشاهدة", callback_data="set_view")],
+        [InlineKeyboardButton("تعديل وقت الانتظار", callback_data="set_wait")],
+        [InlineKeyboardButton("تفعيل/تعطيل التسجيل", callback_data="set_reg")],
+        [InlineKeyboardButton("تعديل مستوى الحماية", callback_data="set_prot")],
+    ])
+    if q:
+        await q.answer(); await q.edit_message_text(text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=kb)
+
+
+async def admin_setting_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await q.answer("غير مصرح.", show_alert=True)
+        return
+    action = q.data
+    if action == "set_reg":
+        new_val = "0" if get_setting("registration_enabled", "1") == "1" else "1"
+        set_setting("registration_enabled", new_val)
+        await q.answer("تم")
+        await q.edit_message_text("✅ تم تحديث حالة التسجيل.", reply_markup=admin_kb())
+        return
+    mapping = {"set_ref": "referral_reward", "set_view": "view_reward", "set_wait": "wait_seconds", "set_prot": "protection_level"}
+    if action in mapping:
+        context.user_data["awaiting_setting_key"] = mapping[action]
+        await q.answer(); await q.edit_message_text("أرسل القيمة الجديدة.")
+
+
+async def admin_protection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        if q:
+            await q.answer("غير مصرح.", show_alert=True)
+        else:
+            await update.message.reply_text("❌ هذا الأمر مخصص للإدارة فقط.")
+        return
+    cur.execute("SELECT COUNT(*) FROM spam_log")
+    spam_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users WHERE banned=1")
+    banned_count = cur.fetchone()[0]
+    text = (
+        f"🚨 الحماية:\n"
+        f"📛 سجلات السبام: {spam_count}\n"
+        f"🚫 المحظورون: {banned_count}\n"
+        f"مستوى الحماية: {get_setting('protection_level', '2')}"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("عرض قائمة السبام", callback_data="prot_spam")],
+        [InlineKeyboardButton("عرض المحظورين", callback_data="prot_banned")],
+        [InlineKeyboardButton("فك حظر مستخدم", callback_data="prot_unban")],
+    ])
+    if q:
+        await q.answer(); await q.edit_message_text(text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=kb)
+
+
+async def admin_protection_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await q.answer("غير مصرح.", show_alert=True)
+        return
+    if q.data == "prot_spam":
+        cur.execute("SELECT user_id, reason FROM spam_log ORDER BY id DESC LIMIT 20")
+        rows = cur.fetchall()
+        text = "📛 آخر سجلات السبام:\n" + ("\n".join([f"{r[0]} - {r[1]}" for r in rows]) if rows else "لا يوجد")
+        await q.answer(); await q.edit_message_text(text, reply_markup=admin_kb())
+    elif q.data == "prot_banned":
+        cur.execute("SELECT user_id FROM users WHERE banned=1 ORDER BY user_id DESC LIMIT 50")
+        rows = cur.fetchall()
+        text = "🚫 المحظورون:\n" + ("\n".join([str(r[0]) for r in rows]) if rows else "لا يوجد")
+        await q.answer(); await q.edit_message_text(text, reply_markup=admin_kb())
+    elif q.data == "prot_unban":
+        context.user_data["awaiting_unban_id"] = True
+        await q.answer(); await q.edit_message_text("أرسل ID المستخدم لفك الحظر.")
+
+
+async def admin_broadcast_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await q.answer("غير مصرح.", show_alert=True)
+        return
+    context.user_data["bc_target"] = "all"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("الكل", callback_data="bc_t_all"), InlineKeyboardButton("VIP", callback_data="bc_t_vip")],
+        [InlineKeyboardButton("غير VIP", callback_data="bc_t_nonvip"), InlineKeyboardButton("المحظورون", callback_data="bc_t_banned")],
+        [InlineKeyboardButton("رسالة نصية", callback_data="bc_m_text")],
+        [InlineKeyboardButton("صورة + نص", callback_data="bc_m_photo")],
+        [InlineKeyboardButton("زر + رابط", callback_data="bc_m_button")],
+    ])
+    await q.answer()
+    await q.edit_message_text("📢 اختر فئة الإرسال ثم نوع البث.", reply_markup=kb)
+
+
+async def admin_broadcast_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await q.answer("غير مصرح.", show_alert=True)
+        return
+    if q.data.startswith("bc_t_"):
+        context.user_data["bc_target"] = q.data.replace("bc_t_", "")
+        await q.answer("تم اختيار الفئة")
+        return
+    if q.data.startswith("bc_m_"):
+        context.user_data["bc_mode"] = q.data.replace("bc_m_", "")
+        context.user_data["broadcast"] = True
+        await q.answer()
+        msg = "أرسل الرسالة الآن."
+        if context.user_data["bc_mode"] == "photo":
+            msg = "أرسل صورة مع تعليق (Caption)."
+        elif context.user_data["bc_mode"] == "button":
+            msg = "أرسل بهذا الشكل: النص | نص الزر | الرابط"
+        await q.edit_message_text(msg)
+
 
 async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("broadcast"):
@@ -817,18 +1193,43 @@ async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["broadcast"] = False
         return
 
-    context.user_data["broadcast"] = False
-    message = update.message.text
-    cur.execute("SELECT user_id FROM users")
+    mode = context.user_data.get("bc_mode", "text")
+    target = context.user_data.get("bc_target", "all")
+
+    where = ""
+    params = []
+    if target == "vip":
+        where = " WHERE vip=1"
+    elif target == "nonvip":
+        where = " WHERE vip=0"
+    elif target == "banned":
+        where = " WHERE banned=1"
+
+    cur.execute("SELECT user_id FROM users" + where, params)
     users = [row[0] for row in cur.fetchall()]
     sent = 0
+
     for user_id in users:
         try:
-            await context.bot.send_message(chat_id=user_id, text=message)
+            if mode == "photo" and update.message.photo:
+                photo_id = update.message.photo[-1].file_id
+                await context.bot.send_photo(chat_id=user_id, photo=photo_id, caption=update.message.caption or "")
+            elif mode == "button":
+                parts = [p.strip() for p in (update.message.text or "").split("|")]
+                if len(parts) != 3:
+                    continue
+                msg, btn_text, btn_url = parts
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton(btn_text, url=btn_url)]])
+                await context.bot.send_message(chat_id=user_id, text=msg, reply_markup=kb)
+            else:
+                await context.bot.send_message(chat_id=user_id, text=update.message.text or "")
             sent += 1
         except Exception:
             continue
-    await update.message.reply_text(f"تم إرسال الرسالة إلى {sent} مستخدم.")
+
+    context.user_data["broadcast"] = False
+    context.user_data.pop("bc_mode", None)
+    await update.message.reply_text(f"تم إرسال البث إلى {sent} مستخدم.")
 
 
 # ================= TEXT SHORTCUTS =================
@@ -851,10 +1252,18 @@ async def handle_text_shortcuts(update: Update, context: ContextTypes.DEFAULT_TY
         await referral(update, context)
     elif text == "📊 إحصائيات البوت":
         await admin_stats(update, context)
-    elif text == "📢 رسالة جماعية":
-        await admin_broadcast(update, context)
-    elif text == "🏆 ترتيب الأعضاء":
+    elif text == "📢 نظام البث":
+        await update.message.reply_text("استخدم الأزرار داخل /admin لإدارة البث المتقدم.", reply_markup=admin_reply_kb())
+    elif text == "📈 نظام الترتيب":
         await admin_top(update, context)
+    elif text == "👤 إدارة مستخدم":
+        await admin_user_manage(update, context)
+    elif text == "💰 إدارة السحب":
+        await admin_withdrawals(update, context)
+    elif text == "🛠️ إعدادات عامة":
+        await admin_settings(update, context)
+    elif text == "🚨 الحماية":
+        await admin_protection(update, context)
     elif text == "➕ إضافة رابط ثابت":
         await admin_add_link(update, context)
     elif text == "🗑 حذف رابط ثابت":
@@ -866,11 +1275,64 @@ async def handle_text_shortcuts(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if is_banned(uid):
+        await update.message.reply_text("🚫 أنت محظور من استخدام البوت.")
+        return
+    touch_user(uid)
+
     if context.user_data.get("awaiting_link"):
         await handle_link_message(update, context)
         return
     if context.user_data.get("awaiting_admin_link"):
         await handle_admin_link_message(update, context)
+        return
+    if context.user_data.get("awaiting_user_id"):
+        context.user_data["awaiting_user_id"] = False
+        if not update.message.text.isdigit():
+            await update.message.reply_text("أرسل ID صحيح.")
+            return
+        await admin_show_user_menu(update, context, int(update.message.text))
+        return
+    if context.user_data.get("awaiting_add_minutes"):
+        target_id = context.user_data.pop("awaiting_add_minutes")
+        try:
+            value = int(update.message.text.strip())
+        except ValueError:
+            await update.message.reply_text("القيمة يجب أن تكون رقمًا.")
+            return
+        cur.execute("UPDATE users SET minutes = minutes + ? WHERE user_id=?", (value, target_id))
+        db.commit()
+        await update.message.reply_text("✅ تم تعديل الرصيد.", reply_markup=admin_reply_kb())
+        return
+    if context.user_data.get("awaiting_level"):
+        target_id = context.user_data.pop("awaiting_level")
+        if not update.message.text.strip().isdigit():
+            await update.message.reply_text("المستوى يجب أن يكون رقمًا.")
+            return
+        cur.execute("UPDATE users SET level=? WHERE user_id=?", (int(update.message.text.strip()), target_id))
+        db.commit()
+        await update.message.reply_text("✅ تم تعديل المستوى.", reply_markup=admin_reply_kb())
+        return
+    if context.user_data.get("awaiting_setting_key"):
+        key = context.user_data.pop("awaiting_setting_key")
+        set_setting(key, update.message.text.strip())
+        await update.message.reply_text("✅ تم حفظ الإعداد.", reply_markup=admin_reply_kb())
+        return
+    if context.user_data.get("awaiting_unban_id"):
+        context.user_data["awaiting_unban_id"] = False
+        if not update.message.text.strip().isdigit():
+            await update.message.reply_text("أرسل ID صحيح.")
+            return
+        cur.execute("UPDATE users SET banned=0 WHERE user_id=?", (int(update.message.text.strip()),))
+        db.commit()
+        await update.message.reply_text("✅ تم فك الحظر.", reply_markup=admin_reply_kb())
+        return
+    if context.user_data.get("awaiting_withdraw_note"):
+        wid = context.user_data.pop("awaiting_withdraw_note")
+        cur.execute("UPDATE withdrawals SET note=? WHERE id=?", (update.message.text.strip(), wid))
+        db.commit()
+        await update.message.reply_text("✅ تمت إضافة الملاحظة.", reply_markup=admin_reply_kb())
         return
     if context.user_data.get("broadcast"):
         await handle_broadcast(update, context)
@@ -896,6 +1358,15 @@ app.add_handler(CallbackQueryHandler(daily, "^daily$"))
 app.add_handler(CallbackQueryHandler(admin_stats, "^a_stats$"))
 app.add_handler(CallbackQueryHandler(admin_broadcast, "^a_bc$"))
 app.add_handler(CallbackQueryHandler(admin_top, "^a_top$"))
+app.add_handler(CallbackQueryHandler(admin_user_manage, "^a_user_manage$"))
+app.add_handler(CallbackQueryHandler(admin_withdrawals, "^a_withdrawals$"))
+app.add_handler(CallbackQueryHandler(admin_settings, "^a_settings$"))
+app.add_handler(CallbackQueryHandler(admin_protection, "^a_protection$"))
+app.add_handler(CallbackQueryHandler(admin_user_action, r"^u_.*_\d+$"))
+app.add_handler(CallbackQueryHandler(admin_withdrawal_action, r"^wd_(ok|no|note)_\d+$"))
+app.add_handler(CallbackQueryHandler(admin_setting_action, r"^set_(ref|view|wait|reg|prot)$"))
+app.add_handler(CallbackQueryHandler(admin_protection_action, r"^prot_(spam|banned|unban)$"))
+app.add_handler(CallbackQueryHandler(admin_broadcast_choice, r"^bc_(t|m)_.+$"))
 app.add_handler(CallbackQueryHandler(admin_add_link, "^a_add_link$"))
 app.add_handler(CallbackQueryHandler(admin_delete_link, "^a_del_link$"))
 app.add_handler(CallbackQueryHandler(admin_list_links, "^a_list_links$"))
