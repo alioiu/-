@@ -281,7 +281,7 @@ def is_admin(uid: int) -> bool:
 def get_user(uid: int):
     cur.execute(
         "SELECT minutes, total_clicks, referrals, last_daily FROM users WHERE user_id=?",
-        (view_reward, uid),
+        (uid,),
     )
     return cur.fetchone()
 
@@ -295,7 +295,7 @@ def get_next_link(uid: int):
         ORDER BY id ASC
         LIMIT 1
         """,
-        (view_reward, uid),
+        (uid,),
     )
     admin_link = cur.fetchone()
     if admin_link:
