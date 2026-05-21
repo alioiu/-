@@ -1545,8 +1545,32 @@ async def withdraw_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if q:
         await q.answer()
+
+    # منع تعارض الحالة: لا تفتح نموذج سحب جديد إذا كان هناك نموذج جارٍ.
+    if context.user_data.get("awaiting_withdraw_address"):
+        msg = "⏳ لديك طلب سحب قيد الإدخال بالفعل. أرسل: العنوان | المبلغ"
+        if q:
+            await q.edit_message_text(msg)
+        else:
+            await update.message.reply_text(msg, reply_markup=main_reply_kb())
+        return
+
+    # منع إنشاء أكثر من طلب سحب معلق لنفس المستخدم.
+    cur.execute(
+        "SELECT id, amount FROM withdrawals WHERE user_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+        (uid,),
+    )
+    pending = cur.fetchone()
+    if pending:
+        msg = f"⚠️ لديك طلب سحب معلق بالفعل (#{pending[0]} بقيمة {pending[1]}). انتظر مراجعة الإدارة أولًا."
+        if q:
+            await q.edit_message_text(msg, reply_markup=main_kb())
+        else:
+            await update.message.reply_text(msg, reply_markup=main_reply_kb())
+        return
+
     context.user_data["awaiting_withdraw_address"] = True
-    msg = "أرسل عنوان USDT ثم المبلغ بهذا الشكل:\nالعنوان | المبلغ"
+    msg = "💸 أرسل عنوان USDT ثم المبلغ بهذا الشكل:\nالعنوان | المبلغ"
     if q:
         await q.edit_message_text(msg)
     else:
@@ -1697,15 +1721,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("صيغة غير صحيحة. استخدم: العنوان | المبلغ")
             return
         address, amount_str = [p.strip() for p in update.message.text.split("|", 1)]
+        if not address:
+            await update.message.reply_text("عنوان USDT مطلوب.")
+            return
         if not amount_str.isdigit():
             await update.message.reply_text("المبلغ يجب أن يكون رقمًا صحيحًا.")
             return
         amount = int(amount_str)
+        if amount <= 0:
+            await update.message.reply_text("المبلغ يجب أن يكون أكبر من صفر.")
+            return
+
+        # منع التضارب: لا تُنشئ طلبًا جديدًا إذا كان هناك طلب معلق.
+        cur.execute("SELECT id FROM withdrawals WHERE user_id=? AND status='pending' LIMIT 1", (uid,))
+        if cur.fetchone():
+            await update.message.reply_text("⚠️ لديك طلب سحب معلق بالفعل. لا يمكن إنشاء طلب جديد الآن.", reply_markup=main_reply_kb())
+            return
+
         cur.execute(
             "INSERT INTO withdrawals (user_id, amount, status, note, requested_at, usdt_address) VALUES (?, ?, 'pending', '', ?, ?)",
             (uid, amount, now_ts(), address),
         )
         db.commit()
+        logger.info("withdraw_request_created user_id=%s amount=%s", uid, amount)
         await update.message.reply_text("✅ تم إرسال طلب السحب للإدارة.", reply_markup=main_reply_kb())
         return
     if context.user_data.get("awaiting_ad"):
