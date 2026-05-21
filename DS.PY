@@ -103,6 +103,16 @@ if "level" not in user_columns:
     cur.execute("ALTER TABLE users ADD COLUMN level INTEGER DEFAULT 1")
 if "last_active" not in user_columns:
     cur.execute("ALTER TABLE users ADD COLUMN last_active INTEGER DEFAULT 0")
+if "points" not in user_columns:
+    cur.execute("ALTER TABLE users ADD COLUMN points INTEGER DEFAULT 0")
+if "today_views" not in user_columns:
+    cur.execute("ALTER TABLE users ADD COLUMN today_views INTEGER DEFAULT 0")
+if "today_refs" not in user_columns:
+    cur.execute("ALTER TABLE users ADD COLUMN today_refs INTEGER DEFAULT 0")
+if "last_task_reset" not in user_columns:
+    cur.execute("ALTER TABLE users ADD COLUMN last_task_reset INTEGER DEFAULT 0")
+if "last_login_bonus" not in user_columns:
+    cur.execute("ALTER TABLE users ADD COLUMN last_login_bonus INTEGER DEFAULT 0")
 
 cur.execute(
     """
@@ -116,6 +126,11 @@ CREATE TABLE IF NOT EXISTS withdrawals (
 )
 """
 )
+
+cur.execute("PRAGMA table_info(withdrawals)")
+withdraw_columns = {row[1] for row in cur.fetchall()}
+if "usdt_address" not in withdraw_columns:
+    cur.execute("ALTER TABLE withdrawals ADD COLUMN usdt_address TEXT")
 
 cur.execute(
     """
@@ -132,6 +147,14 @@ for k, v in {
     "wait_seconds": str(MIN_VISIT_SECONDS),
     "registration_enabled": "1",
     "protection_level": "2",
+    "view_points": "1",
+    "daily_login_points": "2",
+    "daily_task_referrals": "3",
+    "daily_task_views": "5",
+    "daily_task_reward_points": "10",
+    "vip_profit_multiplier": "2",
+    "level_bonus_minutes": "2",
+    "points_to_minutes": "10",
 }.items():
     cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
 
@@ -145,6 +168,34 @@ CREATE TABLE IF NOT EXISTS spam_log (
 )
 """
 )
+
+cur.execute(
+    """
+CREATE TABLE IF NOT EXISTS paid_ads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner INTEGER,
+    url TEXT,
+    expires INTEGER,
+    priority INTEGER DEFAULT 1,
+    created_at INTEGER
+)
+"""
+)
+
+cur.execute(
+    """
+CREATE TABLE IF NOT EXISTS point_shop (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT,
+    points_cost INTEGER,
+    minutes_reward INTEGER,
+    active INTEGER DEFAULT 1
+)
+"""
+)
+
+cur.execute("INSERT OR IGNORE INTO point_shop (id, title, points_cost, minutes_reward, active) VALUES (1, '10 نقاط = 1 دقيقة', 10, 1, 1)")
+cur.execute("INSERT OR IGNORE INTO point_shop (id, title, points_cost, minutes_reward, active) VALUES (2, '50 نقاط = 6 دقائق', 50, 6, 1)")
 db.commit()
 
 
@@ -186,11 +237,60 @@ def log_spam(uid: int, reason: str) -> None:
     db.commit()
 
 
+def reset_daily_counters_if_needed(uid: int) -> None:
+    now = now_ts()
+    cur.execute("SELECT last_task_reset FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    last_reset = row[0] if row and row[0] else 0
+    if now - last_reset >= 86400:
+        cur.execute(
+            "UPDATE users SET today_views=0, today_refs=0, last_task_reset=? WHERE user_id=?",
+            (now, uid),
+        )
+        db.commit()
+
+
+def apply_level_up(uid: int) -> None:
+    cur.execute("SELECT referrals, level FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    if not row:
+        return
+    referrals, level = row
+    desired_level = max(1, referrals // 50 + 1)
+    if desired_level <= level:
+        return
+    bonus = int(get_setting("level_bonus_minutes", "2"))
+    bonus_total = (desired_level - level) * bonus
+    cur.execute(
+        "UPDATE users SET level=?, minutes=minutes+? WHERE user_id=?",
+        (desired_level, bonus_total, uid),
+    )
+    db.commit()
+
+
+def reward_multiplier(uid: int) -> int:
+    cur.execute("SELECT vip, level FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    if not row:
+        return 1
+    vip, level = row
+    mult = 1
+    if vip:
+        mult *= int(get_setting("vip_profit_multiplier", "2"))
+    if level > 1:
+        mult += (level - 1) // 5
+    return max(1, mult)
+
+
 def main_kb():
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🔗 تخطي رابط", callback_data="skip")],
             [InlineKeyboardButton("➕ إضافة رابط", callback_data="add")],
+            [InlineKeyboardButton("🪙 نقاطي / المتجر", callback_data="points")],
+            [InlineKeyboardButton("✅ المهام اليومية", callback_data="tasks")],
+            [InlineKeyboardButton("💸 طلب سحب USDT", callback_data="withdraw")],
+            [InlineKeyboardButton("📌 إعلان مدفوع", callback_data="ad_buy")],
             [
                 InlineKeyboardButton("📊 إحصائياتي", callback_data="stats"),
                 InlineKeyboardButton("🏆 الترتيب", callback_data="top"),
@@ -207,6 +307,8 @@ def main_reply_kb():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("🔗 تخطي رابط"), KeyboardButton("➕ إضافة رابط")],
+            [KeyboardButton("🪙 نقاطي / المتجر"), KeyboardButton("✅ المهام اليومية")],
+            [KeyboardButton("💸 طلب سحب USDT"), KeyboardButton("📌 إعلان مدفوع")],
             [KeyboardButton("📊 إحصائياتي"), KeyboardButton("🏆 الترتيب")],
             [KeyboardButton("🎁 الهدية اليومية"), KeyboardButton("👥 رابط الإحالة")],
         ],
@@ -263,14 +365,18 @@ def ensure_user(uid: int, ref: int | None = None) -> tuple[bool, bool]:
     )
 
     referral_reward = int(get_setting("referral_reward", "1"))
+    referral_points = int(get_setting("view_points", "1"))
     rewarded_ref = False
     if ref and ref != uid:
         cur.execute(
-            "UPDATE users SET minutes = minutes + ?, referrals = referrals + 1 WHERE user_id=?",
-            (referral_reward, ref),
+            "UPDATE users SET minutes = minutes + ?, points = points + ?, referrals = referrals + 1, today_refs = today_refs + 1 WHERE user_id=?",
+            (referral_reward, referral_points, ref),
         )
         rewarded_ref = cur.rowcount > 0
     db.commit()
+    if rewarded_ref:
+        reset_daily_counters_if_needed(ref)
+        apply_level_up(ref)
     return True, rewarded_ref
 
 
@@ -280,13 +386,27 @@ def is_admin(uid: int) -> bool:
 
 def get_user(uid: int):
     cur.execute(
-        "SELECT minutes, total_clicks, referrals, last_daily FROM users WHERE user_id=?",
+        "SELECT minutes, total_clicks, referrals, last_daily, points, level, vip FROM users WHERE user_id=?",
         (uid,),
     )
     return cur.fetchone()
 
 
 def get_next_link(uid: int):
+    cur.execute(
+        """
+        SELECT id, url
+        FROM paid_ads
+        WHERE expires > ?
+        ORDER BY priority DESC, id ASC
+        LIMIT 1
+        """,
+        (now_ts(),),
+    )
+    ad_link = cur.fetchone()
+    if ad_link:
+        return ("ad", ad_link[0], ad_link[1])
+
     cur.execute(
         """
         SELECT id, url
@@ -303,12 +423,13 @@ def get_next_link(uid: int):
 
     cur.execute(
         """
-        SELECT id, url, owner
+        SELECT l.id, l.url, l.owner
         FROM links
-        WHERE owner != ?
-          AND expires > ?
-          AND id NOT IN (SELECT link_id FROM click_history WHERE user_id=?)
-        ORDER BY id ASC
+        JOIN users u ON u.user_id = l.owner
+        WHERE l.owner != ?
+          AND l.expires > ?
+          AND l.id NOT IN (SELECT link_id FROM click_history WHERE user_id=?)
+        ORDER BY u.vip DESC, u.level DESC, l.id ASC
         LIMIT 1
         """,
         (uid, now_ts(), uid),
@@ -401,7 +522,11 @@ async def skip_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    if link[0] == "admin":
+    if link[0] == "ad":
+        _, link_id, url = link
+        context.user_data["pending"] = {"type": "ad", "link_id": link_id, "shown_at": now_ts()}
+        confirm_data = f"confirm_ad_{link_id}"
+    elif link[0] == "admin":
         _, link_id, url = link
         context.user_data["pending"] = {"type": "admin", "link_id": link_id, "shown_at": now_ts()}
         confirm_data = f"confirm_admin_{link_id}"
@@ -434,6 +559,10 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     wait_seconds = int(get_setting("wait_seconds", str(MIN_VISIT_SECONDS)))
     view_reward = int(get_setting("view_reward", "1"))
+    view_points = int(get_setting("view_points", "1"))
+    mult = reward_multiplier(uid)
+    reward_minutes = view_reward * mult
+    reward_points = view_points * mult
 
     last_confirm = context.user_data.get("last_confirm_at", 0)
     if now - last_confirm < CONFIRM_COOLDOWN_SECONDS:
@@ -453,6 +582,23 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⚠️ تأكيد مبكر جدًا. انتظر {wait_seconds} ثوانٍ على الأقل داخل الرابط.",
             show_alert=True,
         )
+        return
+
+    if q.data.startswith("confirm_ad_"):
+        link_id = q.data.replace("confirm_ad_", "")
+        if not link_id.isdigit():
+            await q.edit_message_text("خطأ في الطلب.", reply_markup=main_kb())
+            return
+        link_id = int(link_id)
+        if pending.get("type") != "ad" or pending.get("link_id") != link_id:
+            log_spam(uid, "callback_mismatch_ad")
+            await q.edit_message_text("❌ رابط التأكيد غير مطابق للرابط الحالي.", reply_markup=main_kb())
+            return
+        cur.execute("UPDATE users SET minutes = minutes + ?, points = points + ?, total_clicks = total_clicks + 1, today_views = today_views + 1 WHERE user_id=?", (reward_minutes, reward_points, uid))
+        db.commit()
+        context.user_data["last_confirm_at"] = now
+        context.user_data.pop("pending", None)
+        await q.edit_message_text("✅ تم احتساب المكافأة (دقائق + نقاط)!", reply_markup=main_kb())
         return
 
     if q.data.startswith("confirm_admin_"):
@@ -478,8 +624,8 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("تم احتساب هذا الرابط سابقًا.", reply_markup=main_kb())
             return
         cur.execute(
-            "UPDATE users SET minutes = minutes + ?, total_clicks = total_clicks + 1 WHERE user_id=?",
-            (view_reward, uid),
+            "UPDATE users SET minutes = minutes + ?, points = points + ?, total_clicks = total_clicks + 1, today_views = today_views + 1 WHERE user_id=?",
+            (reward_minutes, reward_points, uid),
         )
         db.commit()
         context.user_data["last_confirm_at"] = now
@@ -516,12 +662,12 @@ async def confirm_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cur.execute(
-        "UPDATE users SET minutes = minutes + ?, total_clicks = total_clicks + 1 WHERE user_id=?",
-        (view_reward, uid),
+        "UPDATE users SET minutes = minutes + ?, points = points + ?, total_clicks = total_clicks + 1, today_views = today_views + 1 WHERE user_id=?",
+        (reward_minutes, reward_points, uid),
     )
     cur.execute(
-        "UPDATE users SET minutes = minutes + ? WHERE user_id=?",
-        (view_reward, owner_id),
+        "UPDATE users SET minutes = minutes + ?, points = points + ? WHERE user_id=?",
+        (reward_minutes, reward_points, owner_id),
     )
     db.commit()
     try:
@@ -554,7 +700,7 @@ async def add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    minutes, _, _, _ = user
+    minutes = user[0]
     if minutes < 20:
         if q:
             await q.answer()
@@ -592,7 +738,7 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("تعذر العثور على بياناتك.")
         return
 
-    minutes, _, _, _ = user
+    minutes = user[0]
     if minutes < 20:
         await update.message.reply_text("❌ تحتاج 20 دقيقة لإضافة رابط.")
         return
@@ -626,12 +772,15 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    minutes, clicks, referrals, _ = user
+    minutes, clicks, referrals, _, points, level, vip = user
     text = (
         "📊 إحصائياتك:\n"
         f"⏱ الدقائق: {minutes}\n"
         f"✅ النقرات: {clicks}\n"
-        f"👥 الإحالات: {referrals}"
+        f"👥 الإحالات: {referrals}\n"
+        f"🪙 النقاط: {points}\n"
+        f"🏷 المستوى: {level}\n"
+        f"💎 VIP: {'نعم' if vip else 'لا'}"
     )
     if q:
         await q.answer()
@@ -751,6 +900,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vip_count = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM users WHERE banned=1")
     banned_count = cur.fetchone()[0]
+    cur.execute("SELECT COALESCE(SUM(amount), 0) FROM withdrawals WHERE status='paid'")
+    total_earnings = cur.fetchone()[0]
 
     text = (
         "📊 إحصائيات شاملة\n"
@@ -759,7 +910,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🤝 إجمالي الإحالات: {total_referrals}\n"
         f"⏱ إجمالي الدقائق: {total_minutes}\n"
         f"💎 عدد VIP: {vip_count}\n"
-        f"🚫 عدد المحظورين: {banned_count}"
+        f"🚫 عدد المحظورين: {banned_count}\n"
+        f"💵 إجمالي المدفوعات: {total_earnings} USDT"
     )
     if q:
         await q.answer()
@@ -1001,7 +1153,7 @@ async def admin_withdrawals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ هذا الأمر مخصص للإدارة فقط.")
         return
-    cur.execute("SELECT id, user_id, amount FROM withdrawals WHERE status='pending' ORDER BY id ASC LIMIT 20")
+    cur.execute("SELECT id, user_id, amount, usdt_address FROM withdrawals WHERE status='pending' ORDER BY id ASC LIMIT 20")
     rows = cur.fetchall()
     if not rows:
         msg = "لا توجد طلبات سحب معلقة."
@@ -1012,8 +1164,8 @@ async def admin_withdrawals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     buttons = []
     lines = ["💰 طلبات السحب:"]
-    for wid, user_id, amount in rows:
-        lines.append(f"#{wid} - {user_id} - {amount}")
+    for wid, user_id, amount, usdt_address in rows:
+        lines.append(f"#{wid} - {user_id} - {amount} - {usdt_address or '-'}")
         buttons.append([InlineKeyboardButton(f"✅ قبول #{wid}", callback_data=f"wd_ok_{wid}"), InlineKeyboardButton(f"❌ رفض #{wid}", callback_data=f"wd_no_{wid}")])
         buttons.append([InlineKeyboardButton(f"📝 ملاحظة #{wid}", callback_data=f"wd_note_{wid}")])
     kb = InlineKeyboardMarkup(buttons)
@@ -1032,7 +1184,14 @@ async def admin_withdrawal_action(update: Update, context: ContextTypes.DEFAULT_
     _, action, wid = q.data.split("_")
     wid = int(wid)
     if action == "ok":
-        cur.execute("UPDATE withdrawals SET status='accepted' WHERE id=?", (wid,))
+        cur.execute("UPDATE withdrawals SET status='paid' WHERE id=?", (wid,))
+        cur.execute("SELECT user_id, amount FROM withdrawals WHERE id=?", (wid,))
+        row = cur.fetchone()
+        if row:
+            try:
+                await context.bot.send_message(chat_id=row[0], text=f"✅ تم دفع طلب السحب #{wid} بقيمة {row[1]} USDT")
+            except Exception:
+                pass
     elif action == "no":
         cur.execute("UPDATE withdrawals SET status='rejected' WHERE id=?", (wid,))
     elif action == "note":
@@ -1232,6 +1391,131 @@ async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"تم إرسال البث إلى {sent} مستخدم.")
 
 
+async def points_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    cur.execute("SELECT points, minutes, level, vip FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone() or (0, 0, 1, 0)
+    points, minutes, level, vip = row
+    cur.execute("SELECT id, title, points_cost, minutes_reward FROM point_shop WHERE active=1 ORDER BY id ASC")
+    items = cur.fetchall()
+    lines = [
+        f"🪙 نقاطك: {points}",
+        f"⏱ دقائقك: {minutes}",
+        f"🏷 مستواك: {level}",
+        f"💎 VIP: {'نعم' if vip else 'لا'}",
+        "",
+        "🛒 المتجر:",
+    ]
+    buttons = []
+    for item_id, title, cost, reward in items:
+        lines.append(f"{item_id}. {title} (التكلفة: {cost})")
+        buttons.append([InlineKeyboardButton(f"استبدال #{item_id}", callback_data=f"shop_buy_{item_id}")])
+    kb = InlineKeyboardMarkup(buttons) if buttons else main_kb()
+    text = "\n".join(lines)
+    if q:
+        await q.answer()
+        await q.edit_message_text(text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=main_reply_kb())
+
+
+async def shop_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    await q.answer()
+    item_id = q.data.replace("shop_buy_", "")
+    if not item_id.isdigit():
+        await q.edit_message_text("طلب غير صالح.", reply_markup=main_kb())
+        return
+    item_id = int(item_id)
+    cur.execute("SELECT points_cost, minutes_reward FROM point_shop WHERE id=? AND active=1", (item_id,))
+    row = cur.fetchone()
+    if not row:
+        await q.edit_message_text("العنصر غير متاح.", reply_markup=main_kb())
+        return
+    cost, reward = row
+    cur.execute("SELECT points FROM users WHERE user_id=?", (uid,))
+    user = cur.fetchone()
+    points = user[0] if user else 0
+    if points < cost:
+        await q.edit_message_text("❌ نقاطك غير كافية.", reply_markup=main_kb())
+        return
+    cur.execute("UPDATE users SET points = points - ?, minutes = minutes + ? WHERE user_id=?", (cost, reward, uid))
+    db.commit()
+    await q.edit_message_text(f"✅ تم الاستبدال بنجاح (+{reward} دقيقة).", reply_markup=main_kb())
+
+
+async def tasks_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    reset_daily_counters_if_needed(uid)
+    cur.execute("SELECT today_refs, today_views, last_login_bonus, points FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone() or (0, 0, 0, 0)
+    today_refs, today_views, last_login_bonus, points = row
+    req_refs = int(get_setting("daily_task_referrals", "3"))
+    req_views = int(get_setting("daily_task_views", "5"))
+    reward_points = int(get_setting("daily_task_reward_points", "10"))
+    text = (
+        "✅ المهام اليومية:\n"
+        f"👥 دعوة {req_refs}: {today_refs}/{req_refs}\n"
+        f"🔗 مشاهدة {req_views}: {today_views}/{req_views}\n"
+        f"🎁 مكافأة إنهاء المهام: {reward_points} نقطة\n"
+        f"🪙 نقاطك الحالية: {points}"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("استلام مكافأة المهام", callback_data="tasks_claim")]])
+    if q:
+        await q.answer()
+        await q.edit_message_text(text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=main_reply_kb())
+
+
+async def tasks_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    await q.answer()
+    reset_daily_counters_if_needed(uid)
+    req_refs = int(get_setting("daily_task_referrals", "3"))
+    req_views = int(get_setting("daily_task_views", "5"))
+    reward_points = int(get_setting("daily_task_reward_points", "10"))
+    cur.execute("SELECT today_refs, today_views, last_task_reset FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone() or (0, 0, 0)
+    today_refs, today_views, last_task_reset = row
+    if today_refs < req_refs or today_views < req_views:
+        await q.edit_message_text("❌ لم تكمل المهام اليومية بعد.", reply_markup=main_kb())
+        return
+    cur.execute("UPDATE users SET points = points + ?, today_refs=0, today_views=0, last_task_reset=? WHERE user_id=?", (reward_points, now_ts(), uid))
+    db.commit()
+    await q.edit_message_text(f"✅ تم إضافة {reward_points} نقطة.", reply_markup=main_kb())
+
+
+async def withdraw_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    if q:
+        await q.answer()
+    context.user_data["awaiting_withdraw_address"] = True
+    msg = "أرسل عنوان USDT ثم المبلغ بهذا الشكل:\nالعنوان | المبلغ"
+    if q:
+        await q.edit_message_text(msg)
+    else:
+        await update.message.reply_text(msg, reply_markup=main_reply_kb())
+
+
+async def ad_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = update.effective_user.id
+    if q:
+        await q.answer()
+    context.user_data["awaiting_ad"] = True
+    msg = "أرسل الإعلان بهذا الشكل:\nالرابط | عدد الدقائق"
+    if q:
+        await q.edit_message_text(msg)
+    else:
+        await update.message.reply_text(msg, reply_markup=main_reply_kb())
+
+
 # ================= TEXT SHORTCUTS =================
 async def handle_text_shortcuts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("awaiting_link") or context.user_data.get("broadcast"):
@@ -1242,6 +1526,14 @@ async def handle_text_shortcuts(update: Update, context: ContextTypes.DEFAULT_TY
         await skip_link(update, context)
     elif text == "➕ إضافة رابط":
         await add_link(update, context)
+    elif text == "🪙 نقاطي / المتجر":
+        await points_panel(update, context)
+    elif text == "✅ المهام اليومية":
+        await tasks_panel(update, context)
+    elif text == "💸 طلب سحب USDT":
+        await withdraw_request(update, context)
+    elif text == "📌 إعلان مدفوع":
+        await ad_buy(update, context)
     elif text == "📊 إحصائياتي":
         await stats(update, context)
     elif text == "🏆 الترتيب":
@@ -1280,6 +1572,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 أنت محظور من استخدام البوت.")
         return
     touch_user(uid)
+    reset_daily_counters_if_needed(uid)
+
+    cur.execute("SELECT last_login_bonus FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    last_login_bonus = row[0] if row and row[0] else 0
+    now = now_ts()
+    if now - last_login_bonus >= 86400:
+        login_points = int(get_setting("daily_login_points", "2"))
+        cur.execute("UPDATE users SET points = points + ?, last_login_bonus=? WHERE user_id=?", (login_points, now, uid))
+        db.commit()
+        await update.message.reply_text(f"🎁 مكافأة الدخول اليومي: +{login_points} نقطة")
 
     if context.user_data.get("awaiting_link"):
         await handle_link_message(update, context)
@@ -1334,10 +1637,59 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.commit()
         await update.message.reply_text("✅ تمت إضافة الملاحظة.", reply_markup=admin_reply_kb())
         return
+    if context.user_data.get("awaiting_withdraw_address"):
+        context.user_data["awaiting_withdraw_address"] = False
+        if "|" not in update.message.text:
+            await update.message.reply_text("صيغة غير صحيحة. استخدم: العنوان | المبلغ")
+            return
+        address, amount_str = [p.strip() for p in update.message.text.split("|", 1)]
+        if not amount_str.isdigit():
+            await update.message.reply_text("المبلغ يجب أن يكون رقمًا صحيحًا.")
+            return
+        amount = int(amount_str)
+        cur.execute(
+            "INSERT INTO withdrawals (user_id, amount, status, note, requested_at, usdt_address) VALUES (?, ?, 'pending', '', ?, ?)",
+            (uid, amount, now_ts(), address),
+        )
+        db.commit()
+        await update.message.reply_text("✅ تم إرسال طلب السحب للإدارة.", reply_markup=main_reply_kb())
+        return
+    if context.user_data.get("awaiting_ad"):
+        context.user_data["awaiting_ad"] = False
+        if "|" not in update.message.text:
+            await update.message.reply_text("صيغة غير صحيحة. استخدم: الرابط | عدد الدقائق")
+            return
+        url, mins = [p.strip() for p in update.message.text.split("|", 1)]
+        if not URL_PATTERN.match(url) or not mins.isdigit():
+            await update.message.reply_text("تحقق من الرابط والمدة.")
+            return
+        minutes = int(mins)
+        cur.execute("SELECT minutes FROM users WHERE user_id=?", (uid,))
+        row = cur.fetchone()
+        user_minutes = row[0] if row else 0
+        if user_minutes < minutes:
+            await update.message.reply_text("❌ رصيد الدقائق غير كافٍ لشراء الإعلان.")
+            return
+        cur.execute("UPDATE users SET minutes = minutes - ? WHERE user_id=?", (minutes, uid))
+        cur.execute(
+            "INSERT INTO paid_ads (owner, url, expires, priority, created_at) VALUES (?, ?, ?, 2, ?)",
+            (uid, url, now_ts() + minutes * 60, now_ts()),
+        )
+        db.commit()
+        await update.message.reply_text("✅ تم شراء إعلانك بنجاح وسيظهر بأولوية.", reply_markup=main_reply_kb())
+        return
     if context.user_data.get("broadcast"):
         await handle_broadcast(update, context)
         return
     await handle_text_shortcuts(update, context)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if hasattr(update, "effective_message") and update.effective_message:
+            await update.effective_message.reply_text("⚠️ حدث خطأ غير متوقع، حاول مرة أخرى.")
+    except Exception:
+        pass
 
 
 # ================= RUN =================
@@ -1350,7 +1702,14 @@ app.add_handler(CallbackQueryHandler(referral, "^ref$"))
 app.add_handler(CallbackQueryHandler(skip_link, "^skip$"))
 app.add_handler(CallbackQueryHandler(confirm_click, r"^confirm_\d+$"))
 app.add_handler(CallbackQueryHandler(confirm_click, r"^confirm_admin_\d+$"))
+app.add_handler(CallbackQueryHandler(confirm_click, r"^confirm_ad_\d+$"))
 app.add_handler(CallbackQueryHandler(add_link, "^add$"))
+app.add_handler(CallbackQueryHandler(points_panel, "^points$"))
+app.add_handler(CallbackQueryHandler(tasks_panel, "^tasks$"))
+app.add_handler(CallbackQueryHandler(tasks_claim, "^tasks_claim$"))
+app.add_handler(CallbackQueryHandler(withdraw_request, "^withdraw$"))
+app.add_handler(CallbackQueryHandler(ad_buy, "^ad_buy$"))
+app.add_handler(CallbackQueryHandler(shop_buy, r"^shop_buy_\d+$"))
 app.add_handler(CallbackQueryHandler(stats, "^stats$"))
 app.add_handler(CallbackQueryHandler(top, "^top$"))
 app.add_handler(CallbackQueryHandler(daily, "^daily$"))
@@ -1374,5 +1733,6 @@ app.add_handler(CallbackQueryHandler(admin_delete_link_confirm, r"^admin_del_\d+
 app.add_handler(CallbackQueryHandler(admin_back, "^back$"))
 
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+app.add_error_handler(on_error)
 
 app.run_polling()
